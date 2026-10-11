@@ -301,18 +301,27 @@ public final class SAInFlightQuery: NSObject {
     ///     or 0 for a statement a reconnect sends, which belongs to whichever query is reconnecting.
     @objc(noteLatestGeneration:ownedByQueryStartedAt:)
     public func noteLatestGeneration(_ generation: UInt, ownedByQueryStartedAt owner: UInt) {
-        requestLock.lock()
-        defer { requestLock.unlock() }
-        storedLatestGeneration = generation
-        latestGenerationThread = Thread.current
-        generationOwners[generation] = owner
+        do {
+            requestLock.lock()
+            defer { requestLock.unlock() }
+            storedLatestGeneration = generation
+            latestGenerationThread = Thread.current
+            generationOwners[generation] = owner
 
-        // Numbers older than the remembered ones count as unknown anyway; their records are dropped
-        // now and then rather than on every query.
-        if generationOwners.count > 2 * Int(Self.rememberedOwners) {
-            let oldest = generation > Self.rememberedOwners ? generation - Self.rememberedOwners : 0
-            generationOwners = generationOwners.filter { $0.key > oldest }
+            // Numbers older than the remembered ones count as unknown anyway; their records are dropped
+            // now and then rather than on every query.
+            if generationOwners.count > 2 * Int(Self.rememberedOwners) {
+                let oldest = generation > Self.rememberedOwners ? generation - Self.rememberedOwners : 0
+                generationOwners = generationOwners.filter { $0.key > oldest }
+            }
         }
+
+        // This is the thread that took the connection, so the work running on it is the work this
+        // statement belongs to. Work that is given up on is settled against the number its own
+        // statement was given, rather than against whatever the connection counts next: a query
+        // another thread starts while this work is on its way back would otherwise be settled as
+        // if it were this work. Outside a piece of coordinated work this tells nobody anything.
+        SAConnectionWorkCoordinator.noteCurrentWorkSentStatement(ofOperation: generation)
     }
 
     /// The number of the query that took the connection last, if a given thread took it.

@@ -34,7 +34,10 @@ public final class SAConnectionWorkOutcome: NSObject {
     private let lock = NSLock()
     private var storedResult: Any?
     private var workHasFinished = false
+    private var workWasGivenUp = false
     private var abandonedAtStamp: UInt?
+    private var operationOfLastStatement: UInt?
+    private let operationAtStart: UInt
     private var storedSessionUse = SAWorkSessionUse.untouched
     private var hasSentSomethingThatMayHaveChangedData = false
 
@@ -45,14 +48,14 @@ public final class SAConnectionWorkOutcome: NSObject {
     @objc public var result: Any? {
         lock.lock()
         defer { lock.unlock() }
-        return abandonedAtStamp == nil ? storedResult : nil
+        return workWasGivenUp ? nil : storedResult
     }
 
     /// Whether the waiting ended before the work did, so that its answer is nobody's any more.
     @objc public var wasAbandoned: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return abandonedAtStamp != nil
+        return workWasGivenUp
     }
 
     /// How the work has used the session. Once the work has been given up on, this no longer changes.
@@ -87,7 +90,7 @@ public final class SAConnectionWorkOutcome: NSObject {
     func beginSessionUse(sessionHasOpenTransaction: Bool, statementMayChangeData: Bool) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard abandonedAtStamp == nil else {
+        guard !workWasGivenUp else {
             return false
         }
         if statementMayChangeData {
@@ -110,7 +113,24 @@ public final class SAConnectionWorkOutcome: NSObject {
         return abandonedAtStamp
     }
 
+    /// Records the operation a statement of this work was given, as soon as it has one.
+    ///
+    /// Called by the connection while this work holds it, so the number is this work's own.
+    /// - Parameter operation: The operation the statement is counted as.
+    func noteStatementSent(ofOperation operation: UInt) {
+        lock.lock()
+        defer { lock.unlock() }
+        operationOfLastStatement = operation
+    }
+
     /// Gives the work up, unless it has already finished.
+    ///
+    /// Settling such work afterwards is measured against the operation this work itself was on -
+    /// its last statement, or, for work that sent nothing, the one it found. Between a piece of
+    /// work giving the connection back and its return here another thread can take it and be
+    /// counted, and settling that one as if it were this work would report its result as cancelled
+    /// and close the session its transaction is in. There is nothing to settle in that case: the
+    /// connection is somebody else's, and whatever this work left behind is their starting point.
     /// - Parameter stamp: The operation the connection is on right now.
     /// - Returns: Whether the work was given up on; false if it had finished after all.
     func abandon(atStamp stamp: UInt) -> Bool {
@@ -119,8 +139,19 @@ public final class SAConnectionWorkOutcome: NSObject {
         guard !workHasFinished else {
             return false
         }
-        abandonedAtStamp = stamp
+        workWasGivenUp = true
+        if stamp == (operationOfLastStatement ?? operationAtStart) {
+            abandonedAtStamp = stamp
+        }
         return true
+    }
+
+    /// Keeps the operation the connection was on when this work was handed over.
+    /// - Parameter operationAtStart: The operation the connection was on, which work that sends
+    ///   nothing of its own is settled against.
+    init(operationAtStart: UInt) {
+        self.operationAtStart = operationAtStart
+        super.init()
     }
 }
 
@@ -204,6 +235,19 @@ public final class SAConnectionWorkCoordinator: NSObject {
                                        statementMayChangeData: statementMayChangeData)
     }
 
+    /// Tells the work running on the current thread which operation its statement was counted as.
+    ///
+    /// Work given up on is settled against the operation the work itself was on, so that another
+    /// thread's query, counted while this work was on its way back, is not settled as if it were
+    /// this work. Called once the statement has its number, which is after the work was allowed
+    /// to send it.
+    /// - Parameter operation: The operation the statement is counted as.
+    @objc(noteCurrentWorkSentStatementOfOperation:)
+    public static func noteCurrentWorkSentStatement(ofOperation operation: UInt) {
+        let outcome = Thread.current.threadDictionary[runningWorkOutcomeKey] as? SAConnectionWorkOutcome
+        outcome?.noteStatementSent(ofOperation: operation)
+    }
+
     /// Whether the work running on the current thread has sent something that can change data.
     @objc public static var currentWorkSentSomethingThatMayHaveChangedData: Bool {
         let outcome = Thread.current.threadDictionary[runningWorkOutcomeKey] as? SAConnectionWorkOutcome
@@ -280,7 +324,7 @@ public final class SAConnectionWorkCoordinator: NSObject {
                     operationStamp: @escaping () -> UInt,
                     whenSlow waitForFinish: (_ isFinished: @escaping () -> Bool) -> Void,
                     whenAbandonedWorkFinishes lateCompletion: @escaping (_ abandonedAtStamp: UInt) -> Void) -> SAConnectionWorkOutcome {
-        let outcome = SAConnectionWorkOutcome()
+        let outcome = SAConnectionWorkOutcome(operationAtStart: operationStamp())
         let workFinished = DispatchSemaphore(value: 0)
 
         // Statements from outside the application, and the connection's own upkeep, stay marked as

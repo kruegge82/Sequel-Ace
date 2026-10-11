@@ -147,6 +147,100 @@ final class SAConnectionWorkCoordinatorTests: XCTestCase {
         XCTAssertFalse(lateCompletionCalled)
     }
 
+    /// Settling stopped work leaves an operation that is not its own alone.
+    ///
+    /// Between the work's last statement and its return here another thread can take the
+    /// connection and be counted. Settling that one as if it were this work would report its
+    /// result as cancelled and close the session its transaction is in.
+    func testStoppedWorkIsNotSettledAgainstAnotherThreadsOperation() throws {
+        var currentOperation: UInt = 1
+        let operationLock = NSLock()
+        let stamp: () -> UInt = {
+            operationLock.lock()
+            defer { operationLock.unlock() }
+            return currentOperation
+        }
+        let workSentItsStatement = DispatchSemaphore(value: 0)
+        let workMayFinish = DispatchSemaphore(value: 0)
+        let settlementLock = NSLock()
+        var settledAtOperation: UInt?
+        var workThread: Thread?
+
+        let outcome = run({
+            workThread = Thread.current
+            // The work's own statement is counted as operation 2.
+            operationLock.lock()
+            currentOperation = 2
+            operationLock.unlock()
+            SAConnectionWorkCoordinator.noteCurrentWorkSentStatement(ofOperation: 2)
+
+            // It gives the connection back, and another thread's query is counted as 3 before the
+            // user stops waiting.
+            operationLock.lock()
+            currentOperation = 3
+            operationLock.unlock()
+            workSentItsStatement.signal()
+            workMayFinish.wait()
+            return "too late"
+        }, stamp: stamp, whenSlow: { _ in
+            XCTAssertEqual(workSentItsStatement.wait(timeout: .now() + 2), .success)
+            coordinator.abandonWorkForUserStop()
+        }, whenAbandonedWorkFinishes: { operation in
+            settlementLock.lock()
+            settledAtOperation = operation
+            settlementLock.unlock()
+        })
+
+        XCTAssertTrue(outcome.wasAbandoned, "the user stopped waiting for it")
+        workMayFinish.signal()
+
+        let thread = try XCTUnwrap(workThread)
+        let deadline = Date().addingTimeInterval(3)
+        while !thread.isFinished && Date() < deadline {
+            usleep(5_000)
+        }
+        XCTAssertTrue(thread.isFinished, "the work has decided whether to report its completion")
+
+        settlementLock.lock()
+        defer { settlementLock.unlock() }
+        XCTAssertNil(settledAtOperation, "operation 3 is another thread's, and not this work's to settle")
+    }
+
+    /// Settling stopped work still happens when the operation is the work's own.
+    func testStoppedWorkIsStillSettledAgainstItsOwnOperation() {
+        var currentOperation: UInt = 1
+        let operationLock = NSLock()
+        let stamp: () -> UInt = {
+            operationLock.lock()
+            defer { operationLock.unlock() }
+            return currentOperation
+        }
+        let workSentItsStatement = DispatchSemaphore(value: 0)
+        let workMayFinish = DispatchSemaphore(value: 0)
+        let settlementReported = DispatchSemaphore(value: 0)
+        var settledAtOperation: UInt?
+
+        _ = run({
+            operationLock.lock()
+            currentOperation = 2
+            operationLock.unlock()
+            SAConnectionWorkCoordinator.noteCurrentWorkSentStatement(ofOperation: 2)
+            workSentItsStatement.signal()
+            workMayFinish.wait()
+            return "too late"
+        }, stamp: stamp, whenSlow: { _ in
+            XCTAssertEqual(workSentItsStatement.wait(timeout: .now() + 2), .success)
+            coordinator.abandonWorkForUserStop()
+        }, whenAbandonedWorkFinishes: { operation in
+            settledAtOperation = operation
+            settlementReported.signal()
+        })
+
+        workMayFinish.signal()
+        XCTAssertEqual(settlementReported.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(settledAtOperation, 2, "nothing else took the connection, so this work settles it")
+    }
+
     /// Queued work that was abandoned never acts as if it were still wanted.
     func testQueuedWorkThatWasAbandonedNeverActsAsIfItWereStillWanted() {
         let firstWorkMayFinish = DispatchSemaphore(value: 0)
@@ -385,7 +479,7 @@ final class SAConnectionWorkCoordinatorTests: XCTestCase {
     /// server may carry it out. A caller told only that its query was cancelled offers to do it
     /// again, which for a row save means inserting it twice.
     func testWorkRemembersHavingSentSomethingThatMayHaveChangedData() {
-        let outcome = SAConnectionWorkOutcome()
+        let outcome = SAConnectionWorkOutcome(operationAtStart: 1)
         XCTAssertFalse(outcome.sentSomethingThatMayHaveChangedData, "nothing has been sent yet")
 
         XCTAssertTrue(outcome.beginSessionUse(sessionHasOpenTransaction: false,
