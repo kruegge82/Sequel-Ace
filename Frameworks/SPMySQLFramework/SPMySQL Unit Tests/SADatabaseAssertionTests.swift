@@ -15,6 +15,212 @@ import XCTest
 final class SADatabaseAssertionTests: XCTestCase {
     private let latin1CharacterSet = Data("latin1".utf8)
 
+    /// Reads and session settings leave the data alone, whatever comments come first.
+    func testReadsAndSessionSettingsLeaveTheDataAlone() {
+        for query in ["SELECT 1", "  select * from t", "/* note */ SHOW TABLES", "-- note\nSELECT 1", "# note\nDESCRIBE t",
+                      "(SELECT 1) UNION (SELECT 2)", "SET NAMES utf8mb4", "USE `db`", "EXPLAIN SELECT 1", "KILL QUERY 5",
+                      "/*!40101 SET NAMES utf8mb4 */", "TABLE t", "desc t", "EXPLAIN FORMAT=JSON SELECT 1"] {
+            XCTAssertTrue(SADatabaseAssertion.statementLeavesDataAlone(query, serverVersion: 80400, serverIsMariaDB: false), query)
+        }
+    }
+
+    /// A SET that only changes the session leaves the data alone, whatever its values read.
+    func testSessionSettingsLeaveTheDataAlone() {
+        for query in ["SET CHARACTER SET utf8mb4", "SET CHARSET utf8mb4", "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                      "SET SESSION TRANSACTION READ ONLY", "SET ROLE ALL", "SET @a = 1", "SET @a := 1, @b = 2;",
+                      "SET time_zone = @@GLOBAL.time_zone", "SET SQL_MODE='GLOBAL,PERSIST'", "SET FOREIGN_KEY_CHECKS = 0",
+                      "SET @@session.sql_mode = '', @@local.x = 1, @@wait_timeout = 10", "SET SESSION sql_mode = 'a,b'",
+                      "SET LOCAL x = 1", "set @x = (SELECT a, b = 1 FROM t)", "SET @`a b` = 'it''s'",
+                      "SET /* GLOBAL */ x = 1", "SET @@sql_mode = @@GLOBAL.sql_mode;;", "SET character_set_client = utf8mb4",
+                      "SET NAMES 'utf8mb4' COLLATE 'utf8mb4_bin', @a = 1", "SET NAMES utf8mb4;", "SET CHARSET DEFAULT, x = 1"] {
+            XCTAssertTrue(SADatabaseAssertion.statementLeavesDataAlone(query, serverVersion: 80400, serverIsMariaDB: false), query)
+        }
+    }
+
+    /// A SET that changes more than the session is taken to change data.
+    func testSettingsBeyondTheSessionAreTakenToChangeData() {
+        for query in ["SET PASSWORD FOR 'u'@'h' = 'x'", "set password = 'x'", "SET GLOBAL max_allowed_packet = 1024",
+                      "SET GLOBAL max_allowed_packet = @@global.max_allowed_packet", "SET PERSIST max_connections = 10",
+                      "SET PERSIST_ONLY back_log = 100", "SET @@GLOBAL.max_connections = 10", "SET @@persist.x = 1",
+                      "SET @@ global . x = 1", "SET @a = 1, GLOBAL max_connections = 10", "SET /*!80000 GLOBAL */ x = 1",
+                      "SET GLOBAL TRANSACTION ISOLATION LEVEL READ COMMITTED", "SET DEFAULT ROLE ALL TO u",
+                      "SET RESOURCE GROUP rg FOR 1", "SET STATEMENT max_statement_time = 1 FOR DELETE FROM t",
+                      "SET @a = 'x\\', GLOBAL y = 1 -- '", "SET @a = 1; DELETE FROM t", "SET x", "SET", "SET `x` = 1",
+                      "SET @ = 1", "SET @a = (1", "SET @a = 'open", "SET @@GTID_PURGED = '1', @@global.gtid_purged = '2'",
+                      "SET NAMES utf8mb4, GLOBAL max_connections = 10", "SET CHARACTER SET utf8, @@global.read_only = 1",
+                      "SET NAMES utf8mb4; DELETE FROM t", "SET CHARSET utf8, x", "SET NAMES 'open"] {
+            XCTAssertFalse(SADatabaseAssertion.statementLeavesDataAlone(query, serverVersion: 80400, serverIsMariaDB: false), query)
+        }
+    }
+
+    /// Anything else is taken to change data, including a write hidden behind a comment.
+    func testEverythingElseIsTakenToChangeData() {
+        for query in ["UPDATE t SET a = 1", "INSERT INTO t VALUES (1)", "delete from t", "COMMIT", "CALL p()",
+                      "WITH x AS (SELECT 1) DELETE FROM t", "/* SELECT */ UPDATE t SET a = 1", "/*!40101 UPDATE t SET a = 1 */",
+                      "SELECTED", "", "   ", "EXPLAIN ANALYZE DELETE t FROM t JOIN u", "explain  analyze select 1",
+                      "EXPLAIN /* note */ ANALYZE DELETE t FROM t JOIN u", "EXPLAIN -- note\nANALYZE DELETE t FROM t JOIN u",
+                      "EXPLAIN ANALYZE FORMAT=TREE SELECT 1"] {
+            XCTAssertFalse(SADatabaseAssertion.statementLeavesDataAlone(query, serverVersion: 80400, serverIsMariaDB: false), query)
+        }
+    }
+
+    func testActiveDatabaseProbePreservesMySQLAndMariaDBResults() {
+        for data in [nil, Data(), Data("main".utf8), Data("資料庫".utf8)] as [Data?] {
+            let expected = SADatabaseSessionValueLookup(data: data, error: nil)
+            var queries: [String] = []
+            let lookup = SADatabaseAssertion.queryActiveDatabaseData { query, returnRowPresence in
+                queries.append(query)
+                XCTAssertFalse(returnRowPresence)
+                return expected
+            }
+            XCTAssertTrue(lookup === expected)
+            XCTAssertEqual(queries, ["SELECT CAST(DATABASE() AS BINARY)"])
+        }
+    }
+
+    func testActiveDatabaseProbeDoesNotHideOtherErrors() {
+        let errors = [
+            SADatabaseAssertionError(errorID: 1064, message: "You have an error in your SQL syntax", sqlState: "42000"),
+            SADatabaseAssertionError(errorID: 1064, message: nil, sqlState: "42000"),
+            SADatabaseAssertionError(errorID: 1142, message: "SELECT command denied", sqlState: "42000"),
+            SADatabaseAssertionError(errorID: 2013, message: "Lost connection", sqlState: "HY000"),
+            SADatabaseAssertionError(errorID: 2013, message: "sphinxql: syntax error, interrupted", sqlState: "HY000"),
+            SADatabaseAssertionError(errorID: 1064, message: "sphinxql: other error", sqlState: "42000")
+        ]
+        for error in errors {
+            var queryCount = 0
+            let lookup = SADatabaseAssertion.queryActiveDatabaseData { _, _ in
+                queryCount += 1
+                return .init(data: nil, error: error)
+            }
+            XCTAssertTrue(lookup.error === error)
+            XCTAssertEqual(queryCount, 1)
+        }
+    }
+
+    func testSphinxFallbackRequiresAnEmptyDatabaseList() {
+        for databasePresence in [nil, Data([1])] as [Data?] {
+            var queries: [String] = []
+            var rowPresenceChecks: [Bool] = []
+            let error = assertDatabase(
+                nil,
+                selectedDatabaseName: nil,
+                databaseStateKnown: false,
+                databaseIsSelected: false,
+                queryActiveDatabaseData: {
+                    SADatabaseAssertion.queryActiveDatabaseData { query, returnRowPresence in
+                        queries.append(query)
+                        rowPresenceChecks.append(returnRowPresence)
+                        if queries.count == 1 {
+                            return .init(data: nil, error: SADatabaseAssertionError(
+                                errorID: 1064,
+                                message: "sphinxql: syntax error, unexpected AS, expecting ')' or ',' near 'AS BINARY)'",
+                                sqlState: "42000"
+                            ))
+                        }
+                        return .init(data: databasePresence, error: nil)
+                    }
+                }
+            )
+            XCTAssertEqual(queries, ["SELECT CAST(DATABASE() AS BINARY)", "SHOW DATABASES"])
+            XCTAssertEqual(rowPresenceChecks, [false, true])
+            XCTAssertEqual(error?.errorID, databasePresence == nil ? nil : 1046)
+        }
+    }
+
+    func testSphinxFallbackRejectsMisleadingDiagnostics() {
+        let castError = "sphinxql: syntax error, unexpected AS, expecting ')' or ',' near 'AS BINARY)'"
+        let errors = [
+            SADatabaseAssertionError(errorID: 1064, message: "sphinxql: syntax error, unexpected SELECT near 'SELECT 1'", sqlState: "42000"),
+            SADatabaseAssertionError(errorID: 1064, message: castError, sqlState: "HY000"),
+            SADatabaseAssertionError(errorID: 1064, message: castError, sqlState: nil),
+            SADatabaseAssertionError(errorID: 1064, message: castError + " from another statement", sqlState: "42000"),
+            SADatabaseAssertionError(errorID: 1064, message: "proxy error: " + castError, sqlState: "42000"),
+            SADatabaseAssertionError(errorID: 1142, message: castError, sqlState: "42000")
+        ]
+        for expectedError in errors {
+            var queryCount = 0
+            let lookup = SADatabaseAssertion.queryActiveDatabaseData { _, _ in
+                queryCount += 1
+                // An empty listing must not turn a different failure into a
+                // successful empty-context assertion.
+                return .init(data: nil, error: queryCount == 1 ? expectedError : nil)
+            }
+            XCTAssertTrue(lookup.error === expectedError, expectedError.message ?? "nil diagnostic")
+            XCTAssertEqual(queryCount, 1)
+        }
+    }
+
+    func testSphinxFallbackPreservesDatabaseListFailure() {
+        let errors = [
+            SADatabaseAssertionError(errorID: 2013, message: "Lost connection", sqlState: "HY000"),
+            SADatabaseAssertionError(errorID: 1142, message: "SHOW command denied", sqlState: "42000"),
+            SADatabaseAssertionError(errorID: 1064, message: "sphinxql: syntax error, listing failed", sqlState: "42000"),
+            SADatabaseAssertionError(errorID: 0, message: "Unable to read database list", sqlState: nil)
+        ]
+        for expectedError in errors {
+            var queries: [String] = []
+            let error = assertDatabase(
+                nil,
+                selectedDatabaseName: nil,
+                databaseStateKnown: false,
+                databaseIsSelected: false,
+                queryActiveDatabaseData: {
+                    SADatabaseAssertion.queryActiveDatabaseData { query, _ in
+                        queries.append(query)
+                        if query == "SHOW DATABASES" {
+                            return .init(data: nil, error: expectedError)
+                        }
+                        return .init(data: nil, error: SADatabaseAssertionError(
+                            errorID: 1064,
+                            message: "sphinxql: syntax error, unexpected AS, expecting ')' or ',' near 'AS BINARY)'",
+                            sqlState: "42000"
+                        ))
+                    }
+                },
+                executeSQL: { _ in unexpectedError("Failed lookup must not execute SQL") },
+                selectDatabase: { _ in unexpectedError("Failed lookup must not select a database") }
+            )
+            XCTAssertTrue(error === expectedError)
+            XCTAssertEqual(queries, ["SELECT CAST(DATABASE() AS BINARY)", "SHOW DATABASES"])
+        }
+    }
+
+    func testSphinxLookingCharsetFailureCannotBypassNamedDatabaseAssertion() {
+        let expectedError = SADatabaseAssertionError(
+            errorID: 1064,
+            message: "sphinxql: syntax error, unexpected AS, expecting ')' or ',' near 'AS BINARY)'",
+            sqlState: "42000"
+        )
+        let error = assertDatabase(
+            "required_日",
+            selectedDatabaseName: nil,
+            databaseStateKnown: true,
+            databaseIsSelected: false,
+            queryActiveDatabaseData: { unexpectedLookup("Named context must not consult the empty-context fallback") },
+            queryClientCharacterSetData: { .init(data: nil, error: expectedError) },
+            executeSQL: { _ in unexpectedError("Charset failure must not mutate session") },
+            selectDatabase: { _ in unexpectedError("Charset failure must not select database") }
+        )
+        XCTAssertTrue(error === expectedError)
+    }
+
+    func testUnknownSelectedContextStillRejectsEmptyAssertion() {
+        for requestedDatabase in [nil, ""] as [String?] {
+            let error = assertDatabase(
+                requestedDatabase,
+                selectedDatabaseName: nil,
+                databaseStateKnown: false,
+                databaseIsSelected: false,
+                queryActiveDatabaseData: { .init(data: Data("main".utf8), error: nil) },
+                executeSQL: { _ in unexpectedError("Wrong context must not execute SQL") },
+                selectDatabase: { _ in unexpectedError("Wrong context must not be silently changed") }
+            )
+            XCTAssertEqual(error?.errorID, 1046)
+            XCTAssertEqual(error?.sqlState, "3D000")
+        }
+    }
+
     func testDisabledAssertionDoesNotConsultOrMutateSession() {
         let error = assertDatabase(
             "target",
@@ -559,8 +765,194 @@ private final class SADatabaseAssertionMismatchRecorder {
 final class SADatabaseAssertionIntegrationTests: XCTestCase, SPMySQLStreamingResultStoreDelegate {
     private var resultStoreDownloadExpectation: XCTestExpectation?
 
+    func testSphinxQueryCanAssertEmptyDatabaseContext() throws {
+        guard let port = ProcessInfo.processInfo.environment["SPMYSQL_TEST_SPHINX_PORT"].flatMap(UInt.init) else {
+            throw XCTSkip("Set SPMYSQL_TEST_SPHINX_PORT to a local Sphinx 3.7.1 mysql41 listener to run this regression.")
+        }
+        let connection = SPMySQLConnection()
+        connection.host = "127.0.0.1"
+        connection.port = port
+        connection.username = "root"
+        connection.useSocket = false
+        connection.useKeepAlive = false
+        XCTAssertTrue(connection.connect())
+        defer { connection.disconnect() }
+
+        // The unasserted query already works; the empty-context probe must not
+        // reject it before the user statement reaches Sphinx (issue #2765).
+        XCTAssertEqual(connection.getFirstField(fromQuery: "SELECT 42") as? String, "42")
+        assertQuerySucceeded(connection)
+
+        // Exercise the first empty-context assertion through the query editor's
+        // streaming API, before the successful fallback has been cached.
+        let store = try XCTUnwrap(connection.resultStore(fromQueryString: "SELECT 42", assertingDatabaseContext: nil))
+        assertQuerySucceeded(connection)
+        let downloaded = expectation(description: "Sphinx result store download completes")
+        resultStoreDownloadExpectation = downloaded
+        store.delegate = self
+        defer {
+            store.cancelLoad()
+            store.delegate = nil
+            resultStoreDownloadExpectation = nil
+        }
+        store.startDownload()
+        let completed = XCTWaiter.wait(for: [downloaded], timeout: 5)
+        XCTAssertEqual(completed, .completed)
+        guard completed == .completed else { return }
+        XCTAssertEqual(store.numberOfRows(), 1)
+        XCTAssertEqual((store.rowContents(at: 0) as? [Any])?.first as? String, "42")
+
+        for _ in 0..<2 {
+            let result = connection.queryString("SELECT 42", assertingDatabaseContext: nil)
+            assertQuerySucceeded(connection)
+            XCTAssertEqual(try row(from: result).first as? String, "42")
+        }
+    }
+
     func resultStoreDidFinishLoadingData(_ resultStore: SPMySQLStreamingResultStore!) {
         resultStoreDownloadExpectation?.fulfill()
+    }
+
+    func testColdEmptyContextProbeAndCacheLifecycle() throws {
+        guard let connection = newLocalConnection(), connection.connect() else {
+            throw XCTSkip("No local MySQL/MariaDB connection available for cold-context regression.")
+        }
+        let identifier = UUID().uuidString.replacingOccurrences(of: "-", with: "_").lowercased()
+        let databaseA = "sa_cold_\(identifier)_a"
+        let databaseB = "sa_cold_\(identifier)_b"
+        defer {
+            for database in [databaseA, databaseB] {
+                _ = connection.queryString("DROP DATABASE IF EXISTS \(backtickQuoted(database))")
+            }
+            connection.disconnect()
+        }
+
+        // A fresh session's state is unknown. Exercise the actual binary
+        // DATABASE() probe through streaming, not an already-tracked DROP/USE.
+        let store = try XCTUnwrap(connection.resultStore(fromQueryString: "SELECT DATABASE()", assertingDatabaseContext: nil))
+        assertQuerySucceeded(connection)
+        XCTAssertTrue(try downloadedRow(from: store).first is NSNull)
+
+        // Once the empty context is known, don't issue a hidden probe that
+        // overwrites session diagnostics for the caller's next statement.
+        _ = connection.queryString("DO 1", assertingDatabaseContext: nil)
+        assertQuerySucceeded(connection)
+        let rowCount = connection.queryString("SELECT ROW_COUNT()", assertingDatabaseContext: nil)
+        assertQuerySucceeded(connection)
+        XCTAssertEqual(try row(from: rowCount).first as? String, "0")
+        _ = connection.queryString("SELECT SQL_CALC_FOUND_ROWS n FROM (SELECT 1 n UNION ALL SELECT 2 UNION ALL SELECT 3) AS values_for_count LIMIT 1", assertingDatabaseContext: nil)
+        assertQuerySucceeded(connection)
+        let foundRows = connection.queryString("SELECT FOUND_ROWS()", assertingDatabaseContext: nil)
+        assertQuerySucceeded(connection)
+        XCTAssertEqual(try row(from: foundRows).first as? String, "3")
+
+        connection.disconnect()
+        XCTAssertTrue(connection.connect())
+        // A second cold session covers the ordinary buffered-query variant.
+        let coldResult = connection.queryString("SELECT DATABASE()", assertingDatabaseContext: nil)
+        assertQuerySucceeded(connection)
+        XCTAssertTrue(try row(from: coldResult).first is NSNull)
+
+        for database in [databaseA, databaseB] {
+            _ = connection.queryString("CREATE DATABASE \(backtickQuoted(database))")
+            assertQuerySucceeded(connection)
+        }
+        _ = connection.queryString("/* context changes after the empty cache */ USE \(backtickQuoted(databaseA))")
+        assertQuerySucceeded(connection)
+        for emptyContext in [nil, ""] as [String?] {
+            _ = connection.queryString("CREATE TABLE assertion_must_not_run (id INT)", assertingDatabaseContext: emptyContext)
+            XCTAssertEqual(connection.lastErrorID(), 1046)
+            XCTAssertEqual(connection.lastSqlstate(), "3D000")
+        }
+        _ = connection.resultStore(fromQueryString: "CREATE TABLE assertion_must_not_run (id INT)", assertingDatabaseContext: nil)
+        XCTAssertEqual(connection.lastErrorID(), 1046)
+        XCTAssertEqual(connection.getFirstField(fromQuery: "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '\(databaseA)' AND table_name = 'assertion_must_not_run'") as? String, "0")
+
+        // A different named context must still select its target, not accept
+        // the cached empty state or execute in the previously selected schema.
+        let selected = connection.queryString("SELECT DATABASE()", assertingDatabase: databaseB)
+        assertQuerySucceeded(connection)
+        XCTAssertEqual(try row(from: selected).first as? String, databaseB)
+        _ = connection.queryString("USE \(backtickQuoted(databaseB + "_missing"))")
+        XCTAssertEqual(connection.lastErrorID(), 1049)
+        let afterFailedUse = connection.queryString("SELECT DATABASE()", assertingDatabase: databaseB)
+        assertQuerySucceeded(connection)
+        XCTAssertEqual(try row(from: afterFailedUse).first as? String, databaseB)
+
+        _ = connection.queryString("DROP DATABASE \(backtickQuoted(databaseB))", assertingDatabase: databaseB)
+        assertQuerySucceeded(connection)
+        let dropped = connection.queryString("SELECT DATABASE()", assertingDatabaseContext: nil)
+        assertQuerySucceeded(connection)
+        XCTAssertTrue(try row(from: dropped).first is NSNull)
+
+        _ = connection.queryString("USE \(backtickQuoted(databaseA))")
+        assertQuerySucceeded(connection)
+        _ = connection.queryString("SELECT 1", assertingDatabaseContext: nil)
+        XCTAssertEqual(connection.lastErrorID(), 1046)
+        connection.disconnect()
+        XCTAssertTrue(connection.connect())
+        // Connection identity must clear the old selected-database cache.
+        let reconnected = connection.queryString("SELECT DATABASE()", assertingDatabaseContext: nil)
+        assertQuerySucceeded(connection)
+        XCTAssertTrue(try row(from: reconnected).first is NSNull)
+    }
+
+    func testColdSelectedContextFromInitConnectFailsClosed() throws {
+        guard let socket = ProcessInfo.processInfo.environment["SPMYSQL_TEST_DISPOSABLE_SOCKET"],
+              let privileged = newLocalConnection() else {
+            throw XCTSkip("Set SPMYSQL_TEST_DISPOSABLE_SOCKET for the init_connect database-context regression.")
+        }
+        privileged.useSocket = true
+        privileged.socketPath = socket
+        guard privileged.connect() else {
+            throw XCTSkip("The disposable server is unavailable.")
+        }
+        defer { privileged.disconnect() }
+        let previousInitConnect = try XCTUnwrap(privileged.getFirstField(fromQuery: "SELECT @@global.init_connect") as? String)
+        let identifier = UUID().uuidString.replacingOccurrences(of: "-", with: "_").lowercased()
+        let database = "sa_init_\(identifier)"
+        let user = "sa_guard_\(identifier.prefix(16))"
+        defer {
+            if let previous = privileged.escapeAndQuoteString(previousInitConnect) {
+                _ = privileged.queryString("SET GLOBAL init_connect = \(previous)")
+            }
+            _ = privileged.queryString("DROP USER IF EXISTS '\(user)'@'%'")
+            _ = privileged.queryString("DROP DATABASE IF EXISTS \(backtickQuoted(database))")
+        }
+        _ = privileged.queryString("CREATE DATABASE \(backtickQuoted(database))")
+        assertQuerySucceeded(privileged)
+        _ = privileged.queryString("CREATE USER '\(user)'@'%' IDENTIFIED BY 'probe'")
+        assertQuerySucceeded(privileged)
+        _ = privileged.queryString("GRANT ALL ON \(backtickQuoted(database)).* TO '\(user)'@'%'")
+        assertQuerySucceeded(privileged)
+        let selection = try XCTUnwrap(privileged.escapeAndQuoteString("USE \(backtickQuoted(database))"))
+        _ = privileged.queryString("SET GLOBAL init_connect = \(selection)")
+        assertQuerySucceeded(privileged)
+
+        for streaming in [false, true] {
+            let connection = try XCTUnwrap(newLocalConnection())
+            connection.useSocket = true
+            connection.socketPath = socket
+            connection.username = user
+            connection.password = "probe"
+            XCTAssertTrue(connection.connect())
+            defer { connection.disconnect() }
+            // The server selected the schema outside the client's tracked SQL,
+            // so only the live cold-cache probe can detect it.
+            let sql = "CREATE TABLE assertion_must_not_run (id INT)"
+            if streaming {
+                _ = connection.resultStore(fromQueryString: sql, assertingDatabaseContext: nil)
+            } else {
+                _ = connection.queryString(sql, assertingDatabaseContext: nil)
+            }
+            XCTAssertEqual(connection.lastErrorID(), 1046)
+            XCTAssertEqual(connection.lastSqlstate(), "3D000")
+            XCTAssertEqual(connection.lastErrorMessage(), "A database is unexpectedly selected on this connection.")
+            let selected = connection.queryString("SELECT DATABASE()", assertingDatabase: database)
+            assertQuerySucceeded(connection)
+            XCTAssertEqual(try row(from: selected).first as? String, database)
+        }
+        XCTAssertEqual(privileged.getFirstField(fromQuery: "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '\(database)' AND table_name = 'assertion_must_not_run'") as? String, "0")
     }
 
     func testQueriesCanAssertDatabaseAtomicallyOnSharedConnection() throws {
@@ -981,6 +1373,23 @@ final class SADatabaseAssertionIntegrationTests: XCTestCase, SPMySQLStreamingRes
         return connection
     }
 
+    private func downloadedRow(from store: SPMySQLStreamingResultStore) throws -> [Any] {
+        let downloaded = expectation(description: "Cold-context streaming result completes")
+        resultStoreDownloadExpectation = downloaded
+        store.delegate = self
+        defer {
+            store.cancelLoad()
+            store.delegate = nil
+            resultStoreDownloadExpectation = nil
+        }
+        store.startDownload()
+        let completed = XCTWaiter.wait(for: [downloaded], timeout: 5)
+        XCTAssertEqual(completed, .completed)
+        guard completed == .completed else { return [] }
+        XCTAssertEqual(store.numberOfRows(), 1)
+        return try XCTUnwrap(store.rowContents(at: 0) as? [Any])
+    }
+
     private func assertQuerySucceeded(
         _ connection: SPMySQLConnection,
         file: StaticString = #filePath,
@@ -1013,5 +1422,107 @@ final class SADatabaseAssertionIntegrationTests: XCTestCase, SPMySQLStreamingRes
 
     private func tickQuoted(_ value: String) -> String {
         "'\(value.replacingOccurrences(of: "'", with: "''"))'"
+    }
+}
+
+/// Which statements can commit a transaction, so that losing the reply to one leaves what became
+/// of that transaction unknown.
+final class SAStatementMayCommitTests: XCTestCase {
+
+    private func mayCommit(_ query: String) -> Bool {
+        SADatabaseAssertion.statementMayCommit(query, serverVersion: 80400, serverIsMariaDB: false)
+    }
+
+    /// The explicit one, however it is written.
+    func testCommitItself() {
+        XCTAssertTrue(mayCommit("COMMIT"))
+        XCTAssertTrue(mayCommit("  commit ; "))
+        XCTAssertTrue(mayCommit("/* done */ COMMIT"))
+    }
+
+    /// Starting a transaction commits whatever was pending.
+    func testStartingATransaction() {
+        XCTAssertTrue(mayCommit("START TRANSACTION"))
+        XCTAssertTrue(mayCommit("BEGIN"))
+    }
+
+    /// The statements the server commits around.
+    func testImplicitlyCommittingStatements() {
+        for query in ["CREATE TABLE t (a INT)", "ALTER TABLE t ADD b INT", "DROP TABLE t",
+                      "TRUNCATE TABLE t", "RENAME TABLE t TO u", "GRANT SELECT ON *.* TO u",
+                      "REVOKE SELECT ON *.* FROM u", "LOCK TABLES t WRITE", "UNLOCK TABLES",
+                      "FLUSH PRIVILEGES", "OPTIMIZE TABLE t", "ANALYZE TABLE t"] {
+            XCTAssertTrue(mayCommit(query), query)
+        }
+    }
+
+    /// The administrative, replication-control and account-management statements the server also
+    /// commits around. Each would otherwise be reported as a definite rollback when its reply is
+    /// lost, while the server had committed the transaction before running it.
+    func testTheAdministrativeAndReplicationStatements() {
+        for query in ["RESET MASTER", "PURGE BINARY LOGS TO 'log.000123'",
+                      "CHANGE REPLICATION SOURCE TO SOURCE_HOST='h'", "CHANGE MASTER TO MASTER_HOST='h'",
+                      "STOP REPLICA", "STOP SLAVE", "CACHE INDEX t IN hot_cache",
+                      "LOAD INDEX INTO CACHE t", "CHECK TABLE t", "REPAIR TABLE t",
+                      "CHECKSUM TABLE t", "INSTALL PLUGIN p SONAME 'p.so'", "UNINSTALL PLUGIN p"] {
+            XCTAssertTrue(mayCommit(query), query)
+        }
+    }
+
+    /// `SET PASSWORD` is account management, so it commits; a value that merely contains the word
+    /// is a different statement.
+    func testSettingAPasswordCommits() {
+        XCTAssertTrue(mayCommit("SET PASSWORD = 'secret'"))
+        XCTAssertTrue(mayCommit("set password for 'u'@'h' = 'secret'"))
+        XCTAssertTrue(mayCommit("SET  PASSWORD='secret'"))
+        XCTAssertFalse(mayCommit("SET @note = 'password'"))
+        XCTAssertFalse(mayCommit("SET sql_mode = 'ANSI'"))
+    }
+
+    /// Setting autocommit commits what was pending, however it is written and wherever it
+    /// stands; the other session settings do not.
+    func testAutocommitAloneAmongTheSessionSettings() {
+        XCTAssertTrue(mayCommit("SET autocommit = 1"))
+        XCTAssertTrue(mayCommit("set  AUTOCOMMIT=0"))
+        XCTAssertTrue(mayCommit("SET SESSION autocommit = 1"))
+        XCTAssertTrue(mayCommit("SET @@session.autocommit = 1"))
+        XCTAssertTrue(mayCommit("SET sql_mode = '', autocommit = 1"))
+        XCTAssertFalse(mayCommit("SET NAMES utf8mb4"))
+        XCTAssertFalse(mayCommit("SET time_zone = '+00:00'"))
+    }
+
+    /// What a procedure does cannot be read from the statement, so a call is taken to commit - and
+    /// a prepared statement is as opaque, since `PREPARE s FROM 'CREATE TABLE …'` makes its
+    /// `EXECUTE` a data-definition statement.
+    func testACallOrAPreparedStatementIsTakenToCommit() {
+        XCTAssertTrue(mayCommit("CALL do_the_thing()"))
+        XCTAssertTrue(mayCommit("  call  other.proc(1)"))
+        XCTAssertTrue(mayCommit("EXECUTE s"))
+        XCTAssertTrue(mayCommit("  execute s USING @a"))
+        XCTAssertFalse(mayCommit("DEALLOCATE PREPARE s"), "throwing the statement away commits nothing")
+    }
+
+    /// `XA COMMIT` commits, in both forms, and the keyword that starts it is `XA`.
+    func testAnXAStatementIsTakenToCommit() {
+        XCTAssertTrue(mayCommit("XA COMMIT 'x'"))
+        XCTAssertTrue(mayCommit("xa commit 'x' one phase"))
+        XCTAssertTrue(mayCommit("  XA  PREPARE 'x'"), "the keyword decides, as it does for RESET")
+    }
+
+    /// MariaDB's `SET STATEMENT … FOR` runs the statement after `FOR`, which can be one the server
+    /// commits around; it is taken to commit as a whole, whatever follows, which costs at most a
+    /// warning too many.
+    func testSetStatementIsTakenToCommit() {
+        XCTAssertTrue(mayCommit("SET STATEMENT foreign_key_checks = 0 FOR TRUNCATE TABLE t"))
+        XCTAssertTrue(mayCommit("set statement max_statement_time = 1 for SELECT 1"))
+        XCTAssertTrue(mayCommit("/* fast */ SET STATEMENT sql_mode = 'ANSI' FOR DROP TABLE t"))
+    }
+
+    /// Ordinary statements, and the one that changes nothing either way.
+    func testStatementsThatCommitNothing() {
+        for query in ["SELECT 1", "UPDATE t SET a = 1", "INSERT INTO t VALUES (1)",
+                      "DELETE FROM t", "ROLLBACK", "SHOW TABLES", ""] {
+            XCTAssertFalse(mayCommit(query), query)
+        }
     }
 }
